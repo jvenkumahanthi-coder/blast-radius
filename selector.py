@@ -26,8 +26,11 @@ SRC = Path(os.environ.get("BR_SRC", APP / "src"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 ALL = "ALL"
-# Diagnostic switch: run everything wherever the analysis would run nothing.
+# Diagnostic switches (all off in a real entry).
 DIAG_EMPTY_ALL = False
+# run everything for commits whose analysis used any of these kinds of decision:
+# "import" (module/class-level code), "data" (fixtures and other files), "runtime", "tests"
+DIAG_KINDS = {"import", "data"}
 # below this many credited tests, import-time-run code is treated as building shared state
 IMPORT_RUN_FEW = 100
 
@@ -219,9 +222,8 @@ class _Canon(ast.NodeTransformer):
 
 
 def canonical(tree):
-    import copy
-
-    return ast.dump(_Canon().visit(copy.deepcopy(tree)))
+    """Rewrites `tree` in place; pass a tree nobody else uses."""
+    return ast.dump(_Canon().visit(tree))
 
 
 def target_names(node):
@@ -275,6 +277,31 @@ class Selector:
         self.funcs = names.get("funcs", {})
         self.test_text = {self.num[k]: v for k, v in names["test_text"].items() if k in self.num}
         self._fixture_text = {}
+        self._src, self._tree, self._dump, self._canon = {}, {}, {}, {}
+
+    def source(self, rel):
+        if rel not in self._src:
+            self._src[rel] = (SRC / rel).read_text(encoding="utf-8")
+        return self._src[rel]
+
+    def tree(self, rel):
+        """Parsed pristine file, cached (it is only read, never changed)."""
+        if rel not in self._tree:
+            try:
+                self._tree[rel] = ast.parse(self.source(rel))
+            except SyntaxError:
+                self._tree[rel] = None
+        return self._tree[rel]
+
+    def dump(self, rel, tree):
+        if rel not in self._dump:
+            self._dump[rel] = ast.dump(tree)
+        return self._dump[rel]
+
+    def canon(self, rel):
+        if rel not in self._canon:
+            self._canon[rel] = canonical(ast.parse(self.source(rel)))
+        return self._canon[rel]
 
     # coverage of a line span in a file
     def cov(self, rel, a, b):
@@ -393,21 +420,21 @@ class Selector:
         old_path = SRC / rel
         if not old_path.exists():
             return ALL, "missing source"
-        old_src = old_path.read_text(encoding="utf-8")
+        old_src = self.source(rel)
         old_lines = old_src.split("\n")
         new_lines, removed, anchors, added = apply_hunks(old_lines, fdiff["hunks"])
         new_src = "\n".join(new_lines)
-        try:
-            old_tree = ast.parse(old_src)
-        except SyntaxError:
+        old_tree = self.tree(rel)
+        if old_tree is None:
             return ALL, "old unparsable"
         try:
             new_tree = ast.parse(new_src)
         except SyntaxError:
             return self.broken_module(rel), "syntax error"
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        old_dump = self.dump(rel, old_tree)
+        if old_dump == ast.dump(new_tree):
             return set(), "ast unchanged"
-        if canonical(old_tree) == canonical(new_tree):
+        if self.canon(rel) == canonical(new_tree):
             return set(), "equivalent"
 
         sel = set()
@@ -432,6 +459,7 @@ class Selector:
             if kind == "import":
                 self.import_touched[rel] = new_src
             if kind == "runtime":
+                self.kinds.add("tests" if rel.startswith("tests/") else "runtime")
                 got = self.cov(rel, a, b)
                 fn = next((c for c in reversed(chain) if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
                 imp = self.import_set.get(rel, ())
@@ -440,6 +468,7 @@ class Selector:
                     # credited with it: what it builds (closures, tables, classes) lives on
                     # and is used by tests that never run this line themselves.
                     self.import_touched[rel] = new_src
+                    self.kinds.add("import")
                     wide = self.import_built(rel, fn, chain)
                     if wide == ALL:
                         return ALL
@@ -518,6 +547,7 @@ class Selector:
 
     def import_change(self, rel, stmt, chain):
         """A change to code that runs at import time (module or class body)."""
+        self.kinds.add("tests" if rel.startswith("tests/") else "import")
         names = target_names(stmt)
         for c in chain:
             if isinstance(c, ast.ClassDef):
@@ -648,6 +678,7 @@ class Selector:
 
     def select(self, patch_text):
         self.import_touched = {}
+        self.kinds = set()
         sel, why = self._select(patch_text)
         self.import_touched.pop("sqlglot/__main__.py", None)  # importing it runs the CLI
         if sel != ALL and self.import_touched:
@@ -669,8 +700,10 @@ class Selector:
             if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
                 r, reason = self.python_file(rel, f)
             elif not rel.startswith(("sqlglot/", "tests/")):
+                self.kinds.add("data")
                 r, reason = self.outside_file(rel), "outside"
             else:
+                self.kinds.add("data")
                 r, reason = self.data_file(rel), "data"
             why.append(f"{rel}:{reason}")
             if r == ALL:
@@ -706,6 +739,8 @@ def main():
             sel, why = s.select(patch.read_text(encoding="utf-8", errors="replace"))
         except Exception as e:  # never crash: run everything
             sel, why = ALL, f"error {e!r}"
+        if DIAG_KINDS & s.kinds and sel != ALL:
+            sel, why = ALL, why + f";diag: {sorted(DIAG_KINDS & s.kinds)} -> all"
         if DIAG_EMPTY_ALL and sel != ALL and not sel:
             sel, why = ALL, why + ";diag: empty -> all"
         if sel == ALL:
