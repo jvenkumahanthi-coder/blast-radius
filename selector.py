@@ -30,7 +30,7 @@ ALL = "ALL"
 DIAG_EMPTY_ALL = False
 # run everything for commits whose analysis used any of these kinds of decision:
 # "import" (module/class-level code), "data" (fixtures and other files), "runtime", "tests"
-DIAG_KINDS = {"import", "data"}
+DIAG_KINDS = {"import"}
 # below this many credited tests, import-time-run code is treated as building shared state
 IMPORT_RUN_FEW = 100
 
