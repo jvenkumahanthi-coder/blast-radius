@@ -27,7 +27,9 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 ALL = "ALL"
 # Diagnostic switch: run everything wherever the analysis would run nothing.
-DIAG_EMPTY_ALL = True
+DIAG_EMPTY_ALL = False
+# below this many credited tests, import-time-run code is treated as building shared state
+IMPORT_RUN_FEW = 100
 
 DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/", "sqlglot/tokenizers/")
 
@@ -260,6 +262,11 @@ class Selector:
         self.lines = cm["lines"]
         self.opens = {p: {idx_to_num[i] for i in v if idx_to_num[i] is not None} for p, v in cm["opens"].items()}
         self.opens_at_collect = set(cm["opens_at_collect"])
+        try:
+            with gzip.open(APP / "importset.json.gz", "rt") as f:
+                self.import_set = {k: set(v) for k, v in json.load(f).items()}
+        except OSError:
+            self.import_set = {}
         names = json.loads((APP / "names.json").read_text())
         self.refs = names["refs"]
         self.import_refs = names["import_refs"]
@@ -426,10 +433,19 @@ class Selector:
                 self.import_touched[rel] = new_src
             if kind == "runtime":
                 got = self.cov(rel, a, b)
-                if not got:
-                    fn = next((c for c in reversed(chain) if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
-                    if fn is not None and fn.body:
-                        got = self.cov(rel, fn.body[0].lineno, fn.end_lineno)
+                fn = next((c for c in reversed(chain) if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+                imp = self.import_set.get(rel, ())
+                if fn is not None and any(x in imp for x in range(a, b + 1)) and len(got) < IMPORT_RUN_FEW:
+                    # This code runs while sqlglot is being imported, and few tests are
+                    # credited with it: what it builds (closures, tables, classes) lives on
+                    # and is used by tests that never run this line themselves.
+                    self.import_touched[rel] = new_src
+                    wide = self.import_built(rel, fn, chain)
+                    if wide == ALL:
+                        return ALL
+                    return got | wide
+                if not got and fn is not None and fn.body:
+                    got = self.cov(rel, fn.body[0].lineno, fn.end_lineno)
                 return got
             return self.import_change(rel, stmt, chain)
 
@@ -480,6 +496,25 @@ class Selector:
         if rel.startswith("tests/"):
             return ALL
         return ALL
+
+    HOOKS = {"__new__", "__init_subclass__", "__set_name__", "__class_getitem__", "__prepare__", "__call__", "__getattr__"}
+
+    def import_built(self, rel, fn, chain):
+        """Tests that use what `fn` builds while sqlglot is imported."""
+        if fn.name in self.HOOKS:
+            return ALL
+        out = self.cov(rel, fn.body[0].lineno, fn.end_lineno)  # its closures run later
+        targets = set()
+        for r, tn in self.import_refs.get(fn.name, []):
+            targets |= set(tn)
+        refs_rt = self.refs.get(fn.name, [])
+        if not targets and not refs_rt:
+            return ALL
+        if targets:
+            out |= self.names_reach(targets)
+        for r, a, b in refs_rt:
+            out |= self.cov(r, a, b)
+        return out if out else ALL
 
     def import_change(self, rel, stmt, chain):
         """A change to code that runs at import time (module or class body)."""

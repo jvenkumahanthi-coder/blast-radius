@@ -21,6 +21,11 @@ Everything is a map of the pinned sqlglot commit (`eb11aec`); nothing is keyed b
      assigned names, followed through import-time assignments; for dialect files,
      narrowed to tests that touch that dialect or a dialect built on it.
    - Fixture or other data file: the tests that opened it.
+   - Code that runs while sqlglot is imported (builder functions, class hooks):
+     what it builds outlives the import, so add the tests that use its closures and
+     the tables built from it (`importset.json.gz`: lines run while sqlglot and every
+     dialect load). Import-time changes are also imported in a scratch copy; a crash
+     there runs every test.
    - Anything the analysis cannot place: every test, on 8 workers.
 4. **Workers**: longest-first assignment, choosing the worker count that minimises
    busiest load + 2 s per worker.
