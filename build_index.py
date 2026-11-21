@@ -167,6 +167,8 @@ def main(root, out_path):
     refs = defaultdict(list)
     import_refs = defaultdict(list)
     parents = {}
+    class_bases = defaultdict(set)
+    funcs = defaultdict(list)
     for sub in ("sqlglot", "tests"):
         for rel, full in walk_py(root, sub):
             src = open(full, encoding="utf-8").read()
@@ -174,6 +176,15 @@ def main(root, out_path):
                 index_file(rel, src, refs, import_refs)
             except SyntaxError:
                 continue
+            if rel.startswith("sqlglot/"):
+                for node in ast.walk(ast.parse(src)):
+                    if isinstance(node, ast.ClassDef):
+                        for b in node.bases:
+                            bn = b.id if isinstance(b, ast.Name) else getattr(b, "attr", "")
+                            if bn:
+                                class_bases[node.name].add(bn)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                        funcs[node.name.lower().replace("_", "")].append([rel, node.body[0].lineno, node.end_lineno])
             if rel.startswith("sqlglot/dialects/"):
                 for node in ast.parse(src).body:
                     if isinstance(node, ast.ClassDef):
@@ -182,6 +193,8 @@ def main(root, out_path):
         "refs": refs,
         "import_refs": import_refs,
         "dialect_parents": parents,
+        "class_bases": {k: sorted(v) for k, v in class_bases.items()},
+        "funcs": funcs,
         "test_text": test_texts(root),
     }
     with open(out_path, "w") as f:

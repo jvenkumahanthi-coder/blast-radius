@@ -199,6 +199,27 @@ def locate(tree, line):
     return best
 
 
+class _Canon(ast.NodeTransformer):
+    """`x is None` and `x == None` behave the same unless x overrides __eq__ to equal
+    None, which nothing in sqlglot does; same for `is not` / `!=`."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        ops = []
+        for op, right in zip(node.ops, node.comparators):
+            if isinstance(right, ast.Constant) and right.value is None:
+                op = ast.Eq() if isinstance(op, (ast.Is, ast.Eq)) else ast.NotEq() if isinstance(op, (ast.IsNot, ast.NotEq)) else op
+            ops.append(op)
+        node.ops = ops
+        return node
+
+
+def canonical(tree):
+    import copy
+
+    return ast.dump(_Canon().visit(copy.deepcopy(tree)))
+
+
 def target_names(node):
     out = set()
     targets = []
@@ -241,6 +262,8 @@ class Selector:
         self.refs = names["refs"]
         self.import_refs = names["import_refs"]
         self.parents = names["dialect_parents"]
+        self.class_bases = names.get("class_bases", {})
+        self.funcs = names.get("funcs", {})
         self.test_text = {self.num[k]: v for k, v in names["test_text"].items() if k in self.num}
         self._fixture_text = {}
 
@@ -310,6 +333,43 @@ class Selector:
                     out |= users
         return out
 
+    def class_scope(self, cls):
+        """Tests that plausibly use class `cls` or a subclass of it, or None if unsure."""
+        names = {cls.name}
+        changed = True
+        while changed:
+            changed = False
+            for c, bases in self.class_bases.items():
+                if c not in names and any(b in names for b in bases):
+                    names.add(c)
+                    changed = True
+        if len(names) > 40:
+            return None  # a base class with many subclasses: too broad to reason about
+        out = set()
+        words = set()
+        for n in names:
+            for rel, a, b in self.refs.get(n, []):
+                out |= self.cov(rel, a, b)
+            for rel, a, b in self.funcs.get(n.lower(), []) + self.funcs.get(n.lower() + "sql", []):
+                out |= self.cov(rel, a, b)
+            words.add(n.lower())
+            words.add(re.sub(r"(?<!^)(?=[A-Z])", "_", n).lower())
+        # explicit SQL names declared in the class body
+        for node in ast.walk(cls):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_sql_names" for t in node.targets):
+                for c in ast.walk(node.value):
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                        words.add(c.value.lower())
+        pats = [re.compile(r"\b" + re.escape(w) + r"\b") for w in words if len(w) > 2]
+        for num, text in self.test_text.items():
+            if any(p.search(text) for p in pats):
+                out.add(num)
+        for path, users in self.opens.items():
+            ft = self.fixture_text(path)
+            if any(p.search(ft) for p in pats):
+                out |= users
+        return out
+
     def fixture_text(self, path):
         if path not in self._fixture_text:
             try:
@@ -338,6 +398,8 @@ class Selector:
             return self.broken_module(rel), "syntax error"
         if ast.dump(old_tree) == ast.dump(new_tree):
             return set(), "ast unchanged"
+        if canonical(old_tree) == canonical(new_tree):
+            return set(), "equivalent"
 
         sel = set()
         reasons = []
@@ -359,7 +421,12 @@ class Selector:
                 return ALL
             kind, (a, b), stmt, chain = loc
             if kind == "runtime":
-                return self.cov(rel, a, b) | self.test_module_guard(rel, chain)
+                got = self.cov(rel, a, b)
+                if not got:
+                    fn = next((c for c in reversed(chain) if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+                    if fn is not None and fn.body:
+                        got = self.cov(rel, fn.body[0].lineno, fn.end_lineno)
+                return got
             return self.import_change(rel, stmt, chain)
 
         for ln in sorted(changed_old):
@@ -420,15 +487,36 @@ class Selector:
             out = set(self.by_file.get(rel, set()))
             out |= self.names_reach(target_names(stmt))
             return out
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.body:
+            # a def line, default argument or annotation: it only matters when the
+            # function runs, and every call runs its body
+            out = self.cov(rel, stmt.body[0].lineno, stmt.end_lineno)
+            if stmt.decorator_list:
+                out |= self.names_reach({stmt.name})
+            return out if out else set()
         own = target_names(stmt)
         if not own:
             return ALL
         reach = self.names_reach(own)
+        # tests that read the name directly (e.g. a test walking every module's table)
+        direct = set()
+        for n in own:
+            for r, a, b in self.refs.get(n, []):
+                if r.startswith("tests/"):
+                    direct |= self.cov(r, a, b)
         d = self.dialect_of(rel)
+        classes = [c for c in chain if isinstance(c, ast.ClassDef)]
+        if isinstance(stmt, ast.ClassDef) and not classes:
+            classes = []  # a class header change: its bases/decorators affect the class everywhere
+        if classes and not d:
+            scope = self.class_scope(classes[-1])
+            if scope is not None:
+                narrowed = reach & scope
+                return (narrowed if narrowed else scope) | direct
         if d:
             scope = self.dialect_scope(d)
             narrowed = reach & scope
-            return narrowed | (scope if not narrowed else set())
+            return narrowed | (scope if not narrowed else set()) | direct
         if not reach:
             return ALL
         return reach

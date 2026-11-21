@@ -68,5 +68,5 @@ def pytest_unconfigure(config):
     _cov.stop()
     _cov.save()
     wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
-    with open(f".opens.{wid}.json", "w") as f:
+    with open(f".opens.{os.environ.get('RUNTAG', 'r0')}.{wid}.json", "w") as f:
         json.dump({k: sorted(v) for k, v in _opens.items()}, f)
