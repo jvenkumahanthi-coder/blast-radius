@@ -535,6 +535,31 @@ class Selector:
             return set()
         return ALL
 
+    CONFIG = ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py", "requirements")
+
+    def outside_file(self, rel):
+        """A file outside sqlglot/ and tests/: only tests that name it can see it,
+        unless it configures the test run itself."""
+        name = Path(rel).name
+        if rel.count("/") == 0 and name.startswith(self.CONFIG):
+            return ALL
+        if rel.startswith(("posts/", "docs/", "benchmarks/", "pdoc/", ".github/")) or name.endswith((".md", ".rst", ".png", ".txt")):
+            return set()
+        parts = {name.lower(), rel.lower()}
+        top = rel.split("/")[0].lower()
+        keys = set(parts)
+        if top != name.lower():
+            keys.add(top)
+        hits = set()
+        for tf, nums in self.by_file.items():
+            try:
+                text = (SRC / tf).read_text(errors="ignore").lower()
+            except OSError:
+                continue
+            if any(k in text for k in keys):
+                hits |= nums
+        return hits
+
     def select(self, patch_text):
         files = parse_patch(patch_text)
         if not files:
@@ -545,12 +570,10 @@ class Selector:
             rel = f["old"] or f["new"]
             if f.get("binary") or f.get("renamed") or f.get("deleted") or f["old"] is None or f["new"] is None:
                 return ALL, f"structural change {rel}"
-            if rel.endswith(".py"):
-                if not (rel.startswith("sqlglot/") or rel.startswith("tests/")):
-                    if rel.startswith(("benchmarks/", "posts/", "docs/", "pdoc/")):
-                        continue
-                    return ALL, f"py outside {rel}"
+            if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
                 r, reason = self.python_file(rel, f)
+            elif not rel.startswith(("sqlglot/", "tests/")):
+                r, reason = self.outside_file(rel), "outside"
             else:
                 r, reason = self.data_file(rel), "data"
             why.append(f"{rel}:{reason}")
