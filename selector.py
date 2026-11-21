@@ -420,6 +420,8 @@ class Selector:
             if loc is None:
                 return ALL
             kind, (a, b), stmt, chain = loc
+            if kind == "import":
+                self.import_touched[rel] = new_src
             if kind == "runtime":
                 got = self.cov(rel, a, b)
                 if not got:
@@ -442,6 +444,7 @@ class Selector:
                     return ALL, f"unlocated new line {ln}"
                 kind, _, stmt, chain = loc
                 if kind == "import":
+                    self.import_touched[rel] = new_src
                     r = self.import_change(rel, stmt, chain)
                     if r == ALL:
                         return ALL, "import add"
@@ -560,7 +563,62 @@ class Selector:
                 hits |= nums
         return hits
 
+    # ----- import-time changes can break the import itself
+    PROBE_DIR = Path(os.environ.get("BR_PROBE", "/tmp/probe"))
+
+    def probe(self, changed):
+        """Import the patched modules in a fresh interpreter. A crash there fails every
+        test that imports them, which no coverage map can see."""
+        import shutil
+        import subprocess
+
+        root = self.PROBE_DIR
+        if not (root / "sqlglot").exists():
+            shutil.copytree(SRC / "sqlglot", root / "sqlglot", ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(SRC / "tests", root / "tests", ignore=shutil.ignore_patterns("fixtures", "__pycache__"))
+        saved = {}
+        try:
+            for rel, new_src in changed.items():
+                p = root / rel
+                saved[rel] = p.read_text(encoding="utf-8") if p.exists() else None
+                p.write_text(new_src, encoding="utf-8")
+            lines = ["import importlib, sqlglot", "from sqlglot.dialects.dialect import Dialect"]
+            for rel in changed:
+                mod = rel[:-3].replace("/", ".")
+                if mod.endswith(".__init__"):
+                    mod = mod[: -len(".__init__")]
+                lines.append(f"importlib.import_module({mod!r})")
+                d = self.dialect_of(rel)
+                if d:
+                    lines.append(
+                        f"try:\n    _d = Dialect.get_or_raise({d!r})\nexcept ValueError:\n    _d = None\n"
+                        f"if _d is not None:\n    sqlglot.transpile('SELECT a, b FROM t WHERE c = 1', read=_d, write=_d)"
+                    )
+            lines.append("sqlglot.transpile('SELECT a, b FROM t WHERE c = 1')")
+            env = dict(os.environ, PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run([sys.executable, "-c", "\n".join(lines)], cwd=str(root), env=env,
+                               capture_output=True, timeout=20)
+            return r.returncode == 0
+        except Exception:
+            return False
+        finally:
+            for rel, old in saved.items():
+                p = root / rel
+                if old is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_text(old, encoding="utf-8")
+
     def select(self, patch_text):
+        self.import_touched = {}
+        sel, why = self._select(patch_text)
+        if sel != ALL and self.import_touched:
+            if not self.probe(self.import_touched):
+                return ALL, why + ";import probe failed"
+            why += ";import probe ok"
+        return sel, why
+
+    def _select(self, patch_text):
         files = parse_patch(patch_text)
         if not files:
             return set(), "empty"
