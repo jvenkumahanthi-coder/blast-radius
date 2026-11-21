@@ -26,6 +26,8 @@ SRC = Path(os.environ.get("BR_SRC", APP / "src"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 ALL = "ALL"
+# Diagnostic switch: run everything wherever the analysis would run nothing.
+DIAG_EMPTY_ALL = True
 
 DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/", "sqlglot/tokenizers/")
 
@@ -612,6 +614,7 @@ class Selector:
     def select(self, patch_text):
         self.import_touched = {}
         sel, why = self._select(patch_text)
+        self.import_touched.pop("sqlglot/__main__.py", None)  # importing it runs the CLI
         if sel != ALL and self.import_touched:
             if not self.probe(self.import_touched):
                 return ALL, why + ";import probe failed"
@@ -668,6 +671,8 @@ def main():
             sel, why = s.select(patch.read_text(encoding="utf-8", errors="replace"))
         except Exception as e:  # never crash: run everything
             sel, why = ALL, f"error {e!r}"
+        if DIAG_EMPTY_ALL and sel != ALL and not sel:
+            sel, why = ALL, why + ";diag: empty -> all"
         if sel == ALL:
             sel = all_nums
         sel = {n for n in sel if n in s.ms}
