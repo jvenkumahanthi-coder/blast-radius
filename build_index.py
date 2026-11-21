@@ -140,6 +140,35 @@ def mentioned_header(s):
     return out
 
 
+IO_HINTS = ("open(", "open_file", "load_sql", "read_text", "read_csv", "read(", "fixtures", "FIXTURES", "json.load", "csv.")
+
+
+def class_setups(root):
+    """Test classes (and modules) whose class/module-level setup reads files. Whatever
+    it loads is shared by every test of the class, though only the first test that
+    happens to run the setup is seen opening the file."""
+    out = []
+    for rel, full in walk_py(root, "tests"):
+        src = open(full, encoding="utf-8").read()
+        lines = src.splitlines()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "setUpModule":
+                text = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+                if any(h in text for h in IO_HINTS):
+                    out.append(rel)
+            if isinstance(node, ast.ClassDef):
+                for fn in node.body:
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in ("setUpClass", "setUp_class"):
+                        text = "\n".join(lines[fn.lineno - 1 : fn.end_lineno])
+                        if any(h in text for h in IO_HINTS):
+                            out.append(f"{rel}::{node.name}")
+    return out
+
+
 def test_texts(root):
     out = {}
     for rel, full in walk_py(root, "tests"):
@@ -196,6 +225,7 @@ def main(root, out_path):
         "class_bases": {k: sorted(v) for k, v in class_bases.items()},
         "funcs": funcs,
         "test_text": test_texts(root),
+        "class_setups": class_setups(root),
     }
     with open(out_path, "w") as f:
         json.dump(out, f, separators=(",", ":"))

@@ -20,7 +20,9 @@ Everything is a map of the pinned sqlglot commit (`eb11aec`); nothing is keyed b
    - Import-time change (module or class body): tests covering run-time uses of the
      assigned names, followed through import-time assignments; for dialect files,
      narrowed to tests that touch that dialect or a dialect built on it.
-   - Fixture or other data file: the tests that opened it.
+   - Fixture or other data file: the tests that opened it, and every test of a class
+     whose class-level setup loads it (that setup runs once, inside whichever test
+     comes first, so only that test is seen opening the file).
    - Code that runs while sqlglot is imported (builder functions, class hooks):
      what it builds outlives the import, so add the tests that use its closures and
      the tables built from it (`importset.json.gz`: lines run while sqlglot and every

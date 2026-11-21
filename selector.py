@@ -276,6 +276,12 @@ class Selector:
         self.class_bases = names.get("class_bases", {})
         self.funcs = names.get("funcs", {})
         self.test_text = {self.num[k]: v for k, v in names["test_text"].items() if k in self.num}
+        # tests grouped by class (or module) whose shared setup reads files
+        self.setup_groups = []
+        for prefix in names.get("class_setups", []):
+            members = {t["number"] for t in self.tests if t["id"] == prefix or t["id"].startswith(prefix + "::")}
+            if members:
+                self.setup_groups.append(members)
         self._fixture_text = {}
         self._src, self._tree, self._dump, self._canon = {}, {}, {}, {}
 
@@ -596,7 +602,12 @@ class Selector:
         if rel in self.opens_at_collect:
             return ALL
         if rel in self.opens:
-            return set(self.opens[rel])
+            users = set(self.opens[rel])
+            # a file loaded by class-level setup is shared by every test of that class
+            for group in self.setup_groups:
+                if users & group:
+                    users |= group
+            return users
         if rel.startswith("tests/"):
             stem = Path(rel).stem
             hits = {n for n, text in self.test_text.items() if stem.lower() in text}
