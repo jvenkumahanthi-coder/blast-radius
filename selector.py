@@ -13,6 +13,7 @@ workers (about 30 simulated seconds), which is far cheaper than a 300 s miss.
 """
 
 import ast
+import copy
 import gzip
 import json
 import os
@@ -226,6 +227,49 @@ def canonical(tree):
     return ast.dump(_Canon().visit(tree))
 
 
+def _text(node, lines):
+    start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+    return "\n".join(lines[start - 1 : node.end_lineno])
+
+
+def same_ast(a, b, la, lb):
+    """Compare two statement lists without dumping untouched code: identical source
+    text means an identical tree. -> "same", "equivalent" (only `is None` vs `== None`
+    differences) or "different"."""
+    if len(a) != len(b):
+        return "different"
+    verdict = "same"
+    for x, y in zip(a, b):
+        if type(x) is not type(y):
+            return "different"
+        if _text(x, la) == _text(y, lb):
+            continue
+        if isinstance(x, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            hx = copy.copy(x)
+            hy = copy.copy(y)
+            hx.body = hy.body = []
+            if ast.dump(hx) != ast.dump(hy):
+                if canonical_node(hx) != canonical_node(hy):
+                    return "different"
+                verdict = "equivalent"
+            inner = same_ast(x.body, y.body, la, lb)
+        else:
+            if ast.dump(x) == ast.dump(y):
+                continue
+            inner = "equivalent" if canonical_node(x) == canonical_node(y) else "different"
+        if inner == "different":
+            return "different"
+        if inner == "equivalent":
+            verdict = "equivalent"
+    return verdict
+
+
+def canonical_node(node):
+    import copy as _c
+
+    return ast.dump(_Canon().visit(_c.deepcopy(node)))
+
+
 def target_names(node):
     out = set()
     targets = []
@@ -284,6 +328,7 @@ class Selector:
                 self.setup_groups.append(members)
         self._fixture_text = {}
         self._src, self._tree, self._dump, self._canon = {}, {}, {}, {}
+        self._scope_cache = {}
 
     def source(self, rel):
         if rel not in self._src:
@@ -351,6 +396,11 @@ class Selector:
 
     def dialect_scope(self, d):
         """Tests that plausibly run dialect `d` (or a dialect built on it)."""
+        if d not in self._scope_cache:
+            self._scope_cache[d] = self._dialect_scope(d)
+        return self._scope_cache[d]
+
+    def _dialect_scope(self, d):
         # dialect class names in this file and every subclass
         family = {d}
         cls_of = {k.lower(): k for k in self.parents}
@@ -437,10 +487,10 @@ class Selector:
             new_tree = ast.parse(new_src)
         except SyntaxError:
             return self.broken_module(rel), "syntax error"
-        old_dump = self.dump(rel, old_tree)
-        if old_dump == ast.dump(new_tree):
+        same = same_ast(old_tree.body, new_tree.body, old_lines, new_lines)
+        if same == "same":
             return set(), "ast unchanged"
-        if self.canon(rel) == canonical(new_tree):
+        if same == "equivalent":
             return set(), "equivalent"
 
         sel = set()
@@ -652,8 +702,7 @@ class Selector:
 
         root = self.PROBE_DIR
         if not (root / "sqlglot").exists():
-            shutil.copytree(SRC / "sqlglot", root / "sqlglot", ignore=shutil.ignore_patterns("__pycache__"))
-            shutil.copytree(SRC / "tests", root / "tests", ignore=shutil.ignore_patterns("fixtures", "__pycache__"))
+            shutil.copytree(SRC / "sqlglot", root / "sqlglot")  # with bytecode
         saved = {}
         try:
             for rel, new_src in changed.items():

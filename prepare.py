@@ -18,6 +18,10 @@ with tarfile.open(archive) as tar:
         m.name = parts[1]
         members.append(m)
     tar.extractall(dest, members=members, filter="data")
+# bytecode for the sandbox imports at run time (compiling sqlglot there costs CPU)
+import compileall
+
+compileall.compile_dir(os.path.join(dest, "sqlglot"), quiet=1)
 here = os.path.dirname(os.path.abspath(__file__))
 subprocess.run([sys.executable, os.path.join(here, "build_index.py"), dest, os.path.join(here, "names.json")], check=True)
 # readable by the unprivileged user the scorer runs as
