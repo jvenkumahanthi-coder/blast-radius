@@ -692,6 +692,10 @@ class Selector:
         self.kinds = set()
         sel, why = self._select(patch_text)
         self.import_touched.pop("sqlglot/__main__.py", None)  # importing it runs the CLI
+        # test modules import duckdb and friends, which this image does not install;
+        # an import error in a test module is already covered by selecting its tests
+        for rel in [r for r in self.import_touched if not r.startswith("sqlglot/")]:
+            self.import_touched.pop(rel)
         if sel != ALL and self.import_touched:
             if not self.probe(self.import_touched):
                 return ALL, why + ";import probe failed"
